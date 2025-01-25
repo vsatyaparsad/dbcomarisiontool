@@ -72,8 +72,16 @@ async function* streamSnowflakeQuery(sql) {
           if (err) {
             console.error('Error getting row count:', err);
           } else {
-            const rows = stmt.getRows();
-            console.log('Expected row count:', rows && rows[0] ? rows[0].TOTAL : 0);
+            stmt.fetchRows({
+              each: (row) => {
+                console.log('Expected row count:', row.TOTAL);
+              },
+              end: (err) => {
+                if (err) {
+                  console.error('Error fetching row count:', err);
+                }
+              }
+            });
           }
         }
       });
