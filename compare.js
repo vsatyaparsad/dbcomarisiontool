@@ -65,6 +65,19 @@ async function* streamSnowflakeQuery(sql) {
       
       console.log('Snowflake connected successfully');
 
+      // First, try to get the row count
+      connection.execute({
+        sqlText: `SELECT COUNT(*) as total FROM (${sql})`,
+        complete: (err, stmt) => {
+          if (err) {
+            console.error('Error getting row count:', err);
+          } else {
+            const rows = stmt.getRows();
+            console.log('Expected row count:', rows && rows[0] ? rows[0].TOTAL : 0);
+          }
+        }
+      });
+
       const statement = connection.execute({
         sqlText: sql,
         streamResult: true,
@@ -76,18 +89,29 @@ async function* streamSnowflakeQuery(sql) {
           }
           
           console.log('Snowflake query executed successfully');
+          console.log('Statement status:', stmt.getStatus());
+          console.log('Statement rowCount:', stmt.getRowCount());
 
           async function* generateChunks() {
             let chunk = [];
             let rowCount = 0;
-            const stream = stmt.streamRows();
             
             try {
               console.log('Starting to stream rows...');
+              
+              // Get stream and check if it's valid
+              const stream = stmt.streamRows();
+              if (!stream) {
+                console.error('Stream is null or undefined');
+                return;
+              }
+
+              console.log('Stream created successfully');
+              
               for await (const row of stream) {
                 rowCount++;
                 if (rowCount === 1) {
-                  console.log('First row received:', row);
+                  console.log('First row data:', JSON.stringify(row, null, 2));
                 }
                 
                 chunk.push(row);
@@ -106,6 +130,7 @@ async function* streamSnowflakeQuery(sql) {
               console.log(`Finished streaming. Total rows processed: ${rowCount}`);
             } catch (error) {
               console.error('Error while streaming rows:', error);
+              console.error('Error details:', error.message);
               throw error;
             } finally {
               console.log('Closing Snowflake connection...');
