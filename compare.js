@@ -65,16 +65,18 @@ async function* streamSnowflakeQuery(sql) {
       
       console.log('Snowflake connected successfully');
 
-      // First, try to get the row count
+      // First, try to get the row count with explicit column alias
       connection.execute({
-        sqlText: `SELECT COUNT(*) as total FROM (${sql})`,
+        sqlText: `SELECT COUNT(1) AS "total" FROM (${sql})`,
         complete: (err, stmt) => {
           if (err) {
             console.error('Error getting row count:', err);
           } else {
+            console.log('Row count statement executed successfully');
             stmt.fetchRows({
               each: (row) => {
-                console.log('Expected row count:', row.TOTAL);
+                console.log('Row count result:', row);
+                console.log('Expected row count:', row.total || row.TOTAL);
               },
               end: (err) => {
                 if (err) {
@@ -86,6 +88,7 @@ async function* streamSnowflakeQuery(sql) {
         }
       });
 
+      // Execute the main query
       const statement = connection.execute({
         sqlText: sql,
         streamResult: true,
@@ -158,6 +161,7 @@ async function* streamSnowflakeQuery(sql) {
     });
   });
 }
+
 
 // Function to create Excel workbook for a chunk of data
 function createChunkWorkbook(chunkNumber, headers) {
