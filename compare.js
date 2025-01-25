@@ -1,4 +1,5 @@
 import pg from 'pg';
+import Cursor from 'pg-cursor';
 import snowflake from 'snowflake-sdk';
 import dotenv from 'dotenv';
 import XLSX from 'xlsx';
@@ -35,7 +36,7 @@ async function* streamPostgresQuery(sql) {
   const client = new pg.Client(pgConfig);
   try {
     await client.connect();
-    const cursor = await client.query(new pg.Cursor(sql));
+    const cursor = client.query(new Cursor(sql));
     
     while (true) {
       const rows = await cursor.read(CHUNK_SIZE);
@@ -99,58 +100,9 @@ async function* streamSnowflakeQuery(sql) {
 // Function to create Excel workbook for a chunk of data
 function createChunkWorkbook(chunkNumber, headers) {
   const wb = XLSX.utils.book_new();
-  
-  // Create summary sheet first
-  const summaryWs = XLSX.utils.aoa_to_sheet([
-    ['Comparison Summary'],
-    [''],
-    ['Category', 'Count', 'Percentage']
-  ]);
-  
-  // Set column widths for summary sheet
-  summaryWs['!cols'] = [
-    { wch: 30 }, // Category column
-    { wch: 15 }, // Count column
-    { wch: 15 }  // Percentage column
-  ];
-  
-  XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary');
-  
-  // Create data sheet
   const ws = XLSX.utils.aoa_to_sheet([headers]);
   XLSX.utils.book_append_sheet(wb, ws, `Chunk ${chunkNumber}`);
-  
-  return { wb, ws, summaryWs };
-}
-
-// Function to update summary statistics
-function updateSummarySheet(wb, stats) {
-  const ws = wb.Sheets['Summary'];
-  
-  // Calculate percentages
-  const totalRecords = Math.max(stats.totalRecords.postgres, stats.totalRecords.snowflake);
-  const matchedPercentage = ((stats.matchedRecords / totalRecords) * 100).toFixed(2);
-  const unmatchedPercentage = (100 - parseFloat(matchedPercentage)).toFixed(2);
-  
-  // Prepare summary data
-  const summaryData = [
-    ['Source Record Counts:', '', ''],
-    ['Postgres Records', stats.totalRecords.postgres, '100%'],
-    ['Snowflake Records', stats.totalRecords.snowflake, '100%'],
-    ['', '', ''],
-    ['Matching Analysis:', '', ''],
-    ['Matched Records', stats.matchedRecords, `${matchedPercentage}%`],
-    ['Unmatched Records', (totalRecords - stats.matchedRecords), `${unmatchedPercentage}%`],
-    ['', '', ''],
-    ['Unmatched Details:', '', ''],
-    ['Records Only in Postgres', stats.postgresOnlyRecords, `${((stats.postgresOnlyRecords / stats.totalRecords.postgres) * 100).toFixed(2)}%`],
-    ['Records Only in Snowflake', stats.snowflakeOnlyRecords, `${((stats.snowflakeOnlyRecords / stats.totalRecords.snowflake) * 100).toFixed(2)}%`]
-  ];
-  
-  // Add data to summary sheet
-  summaryData.forEach((row, idx) => {
-    XLSX.utils.sheet_add_aoa(ws, [row], { origin: `A${idx + 4}` });
-  });
+  return { wb, ws };
 }
 
 // Function to write comparison results in chunks
@@ -159,22 +111,8 @@ async function writeComparisonResults(pgResults, snowflakeResults, outputPath) {
   let rowsInCurrentSheet = 0;
   let { wb, ws } = createChunkWorkbook(currentChunk, ['Source', 'Status', ...Object.keys(pgResults[0] || {})]);
 
-  // Initialize statistics
-  const stats = {
-    totalRecords: {
-      postgres: pgResults.length,
-      snowflake: snowflakeResults.length
-    },
-    matchedRecords: 0,
-    postgresOnlyRecords: 0,
-    snowflakeOnlyRecords: 0
-  };
-
   const writeRow = (row, source, status) => {
     if (rowsInCurrentSheet >= MAX_ROWS_PER_SHEET) {
-      // Update summary before saving
-      updateSummarySheet(wb, stats);
-      
       // Save current workbook and create new one
       XLSX.writeFile(wb, `${outputPath}_part${currentChunk}.xlsx`);
       currentChunk++;
@@ -210,39 +148,27 @@ async function writeComparisonResults(pgResults, snowflakeResults, outputPath) {
     rowsInCurrentSheet++;
   };
 
-  // Process results and track statistics
+  // Process results
   const pgMap = new Map(pgResults.map(row => [JSON.stringify(row), row]));
   const snowflakeMap = new Map(snowflakeResults.map(row => [JSON.stringify(row), row]));
 
   // Write matched and unmatched Postgres records
   for (const row of pgResults) {
     const rowStr = JSON.stringify(row);
-    if (snowflakeMap.has(rowStr)) {
-      stats.matchedRecords++;
-      writeRow(row, 'Postgres', 'Matched');
-    } else {
-      stats.postgresOnlyRecords++;
-      writeRow(row, 'Postgres', 'Postgres Only');
-    }
+    const status = snowflakeMap.has(rowStr) ? 'Matched' : 'Postgres Only';
+    writeRow(row, 'Postgres', status);
   }
 
   // Write Snowflake-only records
   for (const row of snowflakeResults) {
     const rowStr = JSON.stringify(row);
     if (!pgMap.has(rowStr)) {
-      stats.snowflakeOnlyRecords++;
       writeRow(row, 'Snowflake', 'Snowflake Only');
     }
   }
 
-  // Update summary sheet with final statistics
-  updateSummarySheet(wb, stats);
-
   // Save final workbook
   XLSX.writeFile(wb, `${outputPath}_part${currentChunk}.xlsx`);
-  
-  // Return statistics for logging
-  return stats;
 }
 
 // Main comparison function
@@ -288,19 +214,23 @@ async function compareSQLFiles(pgFolder, snowflakeFolder, outputFolder) {
 
         console.log('Creating comparison report...');
         const outputBasePath = path.join(outputFolder, path.parse(sqlFile).name);
-        const stats = await writeComparisonResults(pgResults, snowflakeResults, outputBasePath);
+        await writeComparisonResults(pgResults, snowflakeResults, outputBasePath);
         
-        console.log('\nComparison Summary:');
-        console.log('-------------------');
-        console.log(`Total Postgres Records: ${stats.totalRecords.postgres}`);
-        console.log(`Total Snowflake Records: ${stats.totalRecords.snowflake}`);
-        console.log(`Matched Records: ${stats.matchedRecords}`);
-        console.log(`Records Only in Postgres: ${stats.postgresOnlyRecords}`);
-        console.log(`Records Only in Snowflake: ${stats.snowflakeOnlyRecords}`);
-        console.log(`Match Percentage: ${((stats.matchedRecords / Math.max(stats.totalRecords.postgres, stats.totalRecords.snowflake)) * 100).toFixed(2)}%`);
+        console.log(`Created comparison reports in ${outputFolder}`);
         
-        // Save summary as JSON
-        await fs.writeJSON(`${outputBasePath}_summary.json`, stats, { spaces: 2 });
+        // Generate summary
+        const summary = {
+          totalRecords: {
+            postgres: pgResults.length,
+            snowflake: snowflakeResults.length
+          },
+          matchedRecords: pgResults.filter(row => 
+            snowflakeResults.some(sRow => JSON.stringify(row) === JSON.stringify(sRow))
+          ).length
+        };
+
+        await fs.writeJSON(`${outputBasePath}_summary.json`, summary, { spaces: 2 });
+        console.log('Summary:', summary);
 
       } catch (error) {
         console.error(`Error comparing ${sqlFile}:`, error);
