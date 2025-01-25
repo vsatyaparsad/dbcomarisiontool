@@ -70,24 +70,23 @@ async function* streamSnowflakeQuery(sql) {
 
           async function* generateChunks() {
             let chunk = [];
+            const stream = stmt.streamRows();
             
-            while (true) {
-              const row = stmt.streamRows().next();
-              if (row.done) {
-                if (chunk.length > 0) {
+            try {
+              for await (const row of stream) {
+                chunk.push(row);
+                if (chunk.length >= CHUNK_SIZE) {
                   yield chunk;
+                  chunk = [];
                 }
-                break;
               }
               
-              chunk.push(row.value);
-              if (chunk.length >= CHUNK_SIZE) {
+              if (chunk.length > 0) {
                 yield chunk;
-                chunk = [];
               }
+            } finally {
+              connection.destroy();
             }
-            
-            connection.destroy();
           }
 
           resolve(generateChunks());
