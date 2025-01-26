@@ -156,20 +156,27 @@ function workerMain() {
     excelRow.commit();
   };
 
+function workerMain() {
+  // ... other code remains the same ...
+
   const finalizeWorkbook = async () => {
-    summarySheet.addRows([
-      ['Metric', 'Value'],
-      ['Postgres Row Count', matchedCount + postgresOnlyCount],
-      ['Snowflake Row Count', matchedCount + snowflakeOnlyCount],
-      ['Matched Records', matchedCount],
-      ['Postgres Only Records', postgresOnlyCount],
-      ['Snowflake Only Records', snowflakeOnlyCount],
-      ['Row Count Difference', postgresOnlyCount - snowflakeOnlyCount]
-    ]).commit();
+    // Initialize summary sheet headers
+    summarySheet.addRow(['Metric', 'Value']).commit();
+
+    // Add summary data rows
+    summarySheet.addRow(['Postgres Row Count', matchedCount + postgresOnlyCount]).commit();
+    summarySheet.addRow(['Snowflake Row Count', matchedCount + snowflakeOnlyCount]).commit();
+    summarySheet.addRow(['Matched Records', matchedCount]).commit();
+    summarySheet.addRow(['Postgres Only Records', postgresOnlyCount]).commit();
+    summarySheet.addRow(['Snowflake Only Records', snowflakeOnlyCount]).commit();
+    summarySheet.addRow(['Row Count Difference', postgresOnlyCount - snowflakeOnlyCount]).commit();
 
     await workbook.commit();
     parentPort.postMessage({ done: true });
   };
+
+  // ... rest of the workerMain function remains unchanged ...
+}
 
   processBatch();
 }
