@@ -1,22 +1,20 @@
 import pg from 'pg';
-import Cursor from 'pg-cursor';
 import snowflake from 'snowflake-sdk';
 import dotenv from 'dotenv';
-import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import fs from 'fs-extra';
 import path from 'path';
+import { Worker, isMainThread, parentPort, workerData } from 'worker_threads';
 
 dotenv.config();
 
-const CHUNK_SIZE = 100000;
-const MAX_ROWS_PER_SHEET = 1000000;
-
+// Configure database connections
 const pgConfig = {
   host: process.env.POSTGRES_HOST,
   user: process.env.POSTGRES_USER,
   password: process.env.POSTGRES_PASSWORD,
   database: process.env.POSTGRES_DATABASE,
-  port: process.env.POSTGRES_PORT
+  port: process.env.POSTGRES_PORT,
 };
 
 const snowflakeConfig = {
@@ -25,264 +23,266 @@ const snowflakeConfig = {
   password: process.env.SNOWFLAKE_PASSWORD,
   database: process.env.SNOWFLAKE_DATABASE,
   warehouse: process.env.SNOWFLAKE_WAREHOUSE,
-  schema: process.env.SNOWFLAKE_SCHEMA
+  schema: process.env.SNOWFLAKE_SCHEMA,
 };
 
-async function* streamPostgresQuery(sql) {
+const QUERY_TIMEOUT = 30000; // 30 seconds
+
+// Function to execute Postgres query in batches
+async function executePostgresQueryBatch(sql, batchSize, offset) {
   const client = new pg.Client(pgConfig);
   try {
     await client.connect();
-    const cursor = client.query(new Cursor(sql));
-    
-    while (true) {
-      const rows = await cursor.read(CHUNK_SIZE);
-      if (rows.length === 0) break;
-      yield rows;
-    }
+    const batchSQL = `${sql} LIMIT ${batchSize} OFFSET ${offset}`;
+    const result = await client.query({ text: batchSQL, timeout: QUERY_TIMEOUT });
+    return result.rows.map((row) => {
+      const upperCaseRow = {};
+      for (const key in row) {
+        upperCaseRow[key.toUpperCase()] = row[key];
+      }
+      return upperCaseRow;
+    });
   } finally {
     await client.end();
   }
 }
 
-async function* streamSnowflakeQuery(sql) {
+// Function to execute Snowflake query in batches
+async function executeSnowflakeQueryBatch(sql, batchSize, offset) {
   return new Promise((resolve, reject) => {
-    console.log('Snowflake Config:', {
-      account: snowflakeConfig.account,
-      username: snowflakeConfig.username,
-      database: snowflakeConfig.database,
-      warehouse: snowflakeConfig.warehouse,
-      schema: snowflakeConfig.schema
-    });
-    console.log('Executing SQL:', sql);
-
     const connection = snowflake.createConnection(snowflakeConfig);
 
     connection.connect((err) => {
       if (err) {
-        console.error('Snowflake connection error:', err);
         reject(err);
         return;
       }
 
-      console.log('Connected to Snowflake successfully');
-
-      // Execute the main query
+      const batchSQL = `${sql} LIMIT ${batchSize} OFFSET ${offset}`;
       connection.execute({
-        sqlText: sql,
-        complete: function(err, stmt, rows) {
+        sqlText: batchSQL,
+        complete: (err, stmt, rows) => {
+          connection.destroy();
           if (err) {
-            console.error('Failed to execute query:', err);
-            connection.destroy();
             reject(err);
             return;
           }
-
-          console.log('Query executed successfully');
-          console.log('Number of rows:', rows ? rows.length : 0);
-
-          if (!rows || rows.length === 0) {
-            console.log('No rows returned from query');
-            connection.destroy();
-            resolve([]);
-            return;
-          }
-
-          // Process rows in chunks
-          async function* generateChunks() {
-            let chunk = [];
-            let processedRows = 0;
-
-            for (const row of rows) {
-              chunk.push(row);
-              processedRows++;
-
-              if (chunk.length >= CHUNK_SIZE) {
-                console.log(`Yielding chunk of ${chunk.length} rows. Total processed: ${processedRows}`);
-                yield chunk;
-                chunk = [];
-              }
-            }
-
-            if (chunk.length > 0) {
-              console.log(`Yielding final chunk of ${chunk.length} rows. Total processed: ${processedRows}`);
-              yield chunk;
-            }
-
-            console.log('Finished processing all rows');
-            connection.destroy();
-          }
-
-          resolve(generateChunks());
-        }
+          resolve(rows);
+        },
       });
     });
   });
 }
 
-function createChunkWorkbook(chunkNumber, headers) {
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.aoa_to_sheet([headers]);
-  XLSX.utils.book_append_sheet(wb, ws, `Chunk ${chunkNumber}`);
-  return { wb, ws };
-}
+// Worker function for parallel processing
+function workerFunction() {
+  const { outputPath, pgSQL, snowflakeSQL, batchSize } = workerData;
 
-async function writeComparisonResults(pgResults, snowflakeResults, outputPath) {
-  console.log('Starting to write comparison results');
-  console.log('Postgres results count:', pgResults.length);
-  console.log('Snowflake results count:', snowflakeResults.length);
+  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ filename: outputPath });
 
-  let currentChunk = 1;
-  let rowsInCurrentSheet = 0;
-  
-  // Ensure we have headers even if results are empty
-  const headers = ['Source', 'Status', ...(pgResults[0] ? Object.keys(pgResults[0]) : 
-                                        snowflakeResults[0] ? Object.keys(snowflakeResults[0]) : [])];
-  
-  let { wb, ws } = createChunkWorkbook(currentChunk, headers);
+  const pgSheet = workbook.addWorksheet('Postgres Data');
+  const snowflakeSheet = workbook.addWorksheet('Snowflake Data');
+  const comparisonSheet = workbook.addWorksheet('Detailed Comparison');
+  const summarySheet = workbook.addWorksheet('Summary');
 
-  const writeRow = (row, source, status) => {
-    if (rowsInCurrentSheet >= MAX_ROWS_PER_SHEET) {
-      console.log(`Saving workbook part ${currentChunk}`);
-      XLSX.writeFile(wb, `${outputPath}_part${currentChunk}.xlsx`);
-      currentChunk++;
-      rowsInCurrentSheet = 0;
-      ({ wb, ws } = createChunkWorkbook(currentChunk, headers));
+  let pgHeaders = [];
+  let snowflakeHeaders = [];
+  let comparisonHeaders = [];
+  let offset = 0;
+
+  let matchedCount = 0;
+  let postgresOnlyCount = 0;
+  let snowflakeOnlyCount = 0;
+
+  const processBatch = async () => {
+    const [pgBatch, snowflakeBatch] = await Promise.all([
+      executePostgresQueryBatch(pgSQL, batchSize, offset),
+      executeSnowflakeQueryBatch(snowflakeSQL, batchSize, offset),
+    ]);
+
+    if (pgBatch.length === 0 && snowflakeBatch.length === 0) {
+      parentPort.postMessage({ done: true });
+      return;
     }
 
-    const rowData = {
-      Source: { v: source },
-      Status: { 
-        v: status,
-        s: {
-          fill: { fgColor: { rgb: status === 'Matched' ? "C6EFCE" : "FFC7CE" } },
-          font: { color: { rgb: status === 'Matched' ? "006100" : "9C0006" } }
-        }
-      },
-      ...Object.entries(row).reduce((acc, [key, value]) => {
-        acc[key] = {
-          v: value,
-          s: {
-            fill: { fgColor: { rgb: status === 'Matched' ? "C6EFCE" : "FFC7CE" } },
-            font: { color: { rgb: status === 'Matched' ? "006100" : "9C0006" } }
-          }
-        };
-        return acc;
-      }, {})
-    };
+    if (offset === 0) {
+      pgHeaders = Object.keys(pgBatch[0] || {});
+      snowflakeHeaders = Object.keys(snowflakeBatch[0] || {});
+      comparisonHeaders = [...pgHeaders, 'Status'];
 
-    XLSX.utils.sheet_add_json(ws, [rowData], { 
-      skipHeader: true,
-      origin: -1
+      pgSheet.columns = pgHeaders.map((key) => ({ header: key, key }));
+      snowflakeSheet.columns = snowflakeHeaders.map((key) => ({ header: key, key }));
+      comparisonSheet.columns = comparisonHeaders.map((key) => ({ header: key, key }));
+    }
+
+    pgBatch.forEach((row) => pgSheet.addRow(row).commit());
+    snowflakeBatch.forEach((row) => snowflakeSheet.addRow(row).commit());
+
+    const snowflakeMap = new Map(snowflakeBatch.map((row) => [JSON.stringify(row), row]));
+
+    pgBatch.forEach((pgRow) => {
+      const match = snowflakeMap.get(JSON.stringify(pgRow));
+      const status = match ? 'Matched' : 'Postgres Only';
+
+      const rowData = { ...pgRow, Status: status };
+      const row = comparisonSheet.addRow(rowData);
+
+      Object.keys(pgRow).forEach((key) => {
+        const cell = row.getCell(key);
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: match ? 'C6EFCE' : 'FFC7CE' },
+        };
+        cell.font = { color: { argb: match ? '006100' : '9C0006' } };
+      });
+
+      const statusCell = row.getCell('Status');
+      statusCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: match ? 'C6EFCE' : 'FFC7CE' },
+      };
+      statusCell.font = { color: { argb: match ? '006100' : '9C0006' } };
+
+      if (match) {
+        matchedCount++;
+      } else {
+        postgresOnlyCount++;
+      }
+
+      row.commit();
     });
-    rowsInCurrentSheet++;
+
+    snowflakeBatch.forEach((snowflakeRow) => {
+      if (!pgBatch.some((pgRow) => JSON.stringify(pgRow) === JSON.stringify(snowflakeRow))) {
+        const rowData = { ...snowflakeRow, Status: 'Snowflake Only' };
+        const row = comparisonSheet.addRow(rowData);
+
+        Object.keys(snowflakeRow).forEach((key) => {
+          const cell = row.getCell(key);
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFC7CE' },
+          };
+          cell.font = { color: { argb: '9C0006' } };
+        });
+
+        const statusCell = row.getCell('Status');
+        statusCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFC7CE' },
+        };
+        statusCell.font = { color: { argb: '9C0006' } };
+
+        snowflakeOnlyCount++;
+        row.commit();
+      }
+    });
+
+    offset += batchSize;
+    processBatch();
   };
 
-  // Process results
-  const pgMap = new Map(pgResults.map(row => [JSON.stringify(row), row]));
-  const snowflakeMap = new Map(snowflakeResults.map(row => [JSON.stringify(row), row]));
+  processBatch().catch((err) => {
+    parentPort.postMessage({ error: err });
+  });
 
-  console.log('Processing Postgres records...');
-  for (const row of pgResults) {
-    const rowStr = JSON.stringify(row);
-    const status = snowflakeMap.has(rowStr) ? 'Matched' : 'Postgres Only';
-    writeRow(row, 'Postgres', status);
-  }
+  parentPort.on('message', async (message) => {
+    if (message.done) {
+      summarySheet.addRow(['Metric', 'Value']).commit();
+      summarySheet.addRow(['Postgres Row Count', matchedCount + postgresOnlyCount]).commit();
+      summarySheet.addRow(['Snowflake Row Count', matchedCount + snowflakeOnlyCount]).commit();
+      summarySheet.addRow(['Matched Records', matchedCount]).commit();
+      summarySheet.addRow(['Postgres Only Records', postgresOnlyCount]).commit();
+      summarySheet.addRow(['Snowflake Only Records', snowflakeOnlyCount]).commit();
+      summarySheet.addRow(['Row Count Difference', postgresOnlyCount - snowflakeOnlyCount]).commit();
 
-  console.log('Processing Snowflake records...');
-  for (const row of snowflakeResults) {
-    const rowStr = JSON.stringify(row);
-    if (!pgMap.has(rowStr)) {
-      writeRow(row, 'Snowflake', 'Snowflake Only');
+      await workbook.commit();
+      parentPort.postMessage({ done: true });
     }
-  }
-
-  console.log(`Saving final workbook part ${currentChunk}`);
-  XLSX.writeFile(wb, `${outputPath}_part${currentChunk}.xlsx`);
+  });
 }
 
-async function compareSQLFiles(pgFolder, snowflakeFolder, outputFolder) {
+// Main comparison function
+async function compareSQLFiles(pgFolder, snowflakeFolder, outputFolder, batchSize = 5000) {
   try {
-    console.log('Starting comparison process...');
-    console.log('Creating output folder:', outputFolder);
     await fs.ensureDir(outputFolder);
-    
+
     const pgFiles = await fs.readdir(pgFolder);
-    const sqlFiles = pgFiles.filter(file => file.endsWith('.sql'));
+    const sqlFiles = pgFiles.filter((file) => file.endsWith('.sql'));
 
     console.log(`Found ${sqlFiles.length} SQL files to compare`);
 
-    for (const sqlFile of sqlFiles) {
-      console.log(`\nProcessing ${sqlFile}...`);
+    const MAX_CONCURRENT_FILES = 3;
+    const fileChunks = [];
 
-      const pgPath = path.join(pgFolder, sqlFile);
-      const snowflakePath = path.join(snowflakeFolder, sqlFile);
-
-      if (!await fs.pathExists(snowflakePath)) {
-        console.log(`Warning: No matching Snowflake file found for ${sqlFile}`);
-        continue;
-      }
-
-      const pgSQL = await fs.readFile(pgPath, 'utf8');
-      const snowflakeSQL = await fs.readFile(snowflakePath, 'utf8');
-
-      try {
-        console.log('Fetching data from databases...');
-        
-        let pgResults = [];
-        let snowflakeResults = [];
-        
-        // Stream Postgres results
-        for await (const chunk of streamPostgresQuery(pgSQL)) {
-          pgResults.push(...chunk);
-          console.log(`Processed ${pgResults.length} Postgres records...`);
-        }
-
-        // Stream Snowflake results
-        for await (const chunk of await streamSnowflakeQuery(snowflakeSQL)) {
-          snowflakeResults.push(...chunk);
-          console.log(`Processed ${snowflakeResults.length} Snowflake records...`);
-        }
-
-        console.log('Creating comparison report...');
-        const outputBasePath = path.join(outputFolder, path.parse(sqlFile).name);
-        await writeComparisonResults(pgResults, snowflakeResults, outputBasePath);
-        
-        console.log(`Created comparison reports in ${outputFolder}`);
-        
-        // Generate summary
-        const summary = {
-          totalRecords: {
-            postgres: pgResults.length,
-            snowflake: snowflakeResults.length
-          },
-          matchedRecords: pgResults.filter(row => 
-            snowflakeResults.some(sRow => JSON.stringify(row) === JSON.stringify(sRow))
-          ).length
-        };
-
-        await fs.writeJSON(`${outputBasePath}_summary.json`, summary, { spaces: 2 });
-        console.log('Summary:', summary);
-
-      } catch (error) {
-        console.error(`Error comparing ${sqlFile}:`, error);
-        throw error; // Re-throw to stop processing if there's an error
-      }
+    for (let i = 0; i < sqlFiles.length; i += MAX_CONCURRENT_FILES) {
+      fileChunks.push(sqlFiles.slice(i, i + MAX_CONCURRENT_FILES));
     }
 
-    console.log('\nComparison complete!');
+    for (const chunk of fileChunks) {
+      await Promise.all(
+        chunk.map(async (sqlFile) => {
+          try {
+            console.log(`Processing file: ${sqlFile}...`);
 
+            const pgPath = path.join(pgFolder, sqlFile);
+            const snowflakePath = path.join(snowflakeFolder, sqlFile);
+
+            if (!(await fs.pathExists(snowflakePath))) {
+              console.warn(`No matching Snowflake file found for ${sqlFile}`);
+              return;
+            }
+
+            const pgSQL = await fs.readFile(pgPath, 'utf8');
+            const snowflakeSQL = await fs.readFile(snowflakePath, 'utf8');
+
+            const outputPath = path.join(outputFolder, `${path.parse(sqlFile).name}_comparison.xlsx`);
+
+            const worker = new Worker(__filename, {
+              workerData: { outputPath, pgSQL, snowflakeSQL, batchSize },
+            });
+
+            worker.on('message', (message) => {
+              if (message.done) {
+                console.log(`Completed file: ${sqlFile}`);
+              } else if (message.error) {
+                console.error(`Error processing file ${sqlFile}:`, message.error);
+              }
+            });
+
+            worker.on('error', (error) => {
+              console.error(`Worker error for file ${sqlFile}:`, error);
+            });
+
+            worker.on('exit', (code) => {
+              if (code !== 0) {
+                console.error(`Worker stopped with exit code ${code} for file ${sqlFile}`);
+              }
+            });
+          } catch (error) {
+            console.error(`Error processing file ${sqlFile}:`, error);
+          }
+        })
+      );
+    }
+
+    console.log('Comparison complete!');
   } catch (error) {
     console.error('Error during comparison:', error);
-    throw error;
   }
 }
 
-// Example usage
-const pgFolder = './postgres_sqls';
-const snowflakeFolder = './snowflake_sqls';
-const outputFolder = './comparison_results';
+if (isMainThread) {
+  // Example usage
+  const pgFolder = './postgres_sqls'; // Folder containing Postgres SQL files
+  const snowflakeFolder = './snowflake_sqls'; // Folder containing Snowflake SQL files
+  const outputFolder = './comparison_results'; // Folder for Excel reports
 
-compareSQLFiles(pgFolder, snowflakeFolder, outputFolder).catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+  compareSQLFiles(pgFolder, snowflakeFolder, outputFolder).catch(console.error);
+} else {
+  workerFunction();
+}
